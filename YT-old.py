@@ -18,13 +18,13 @@ from google.auth.transport.requests import Request
 # ===================================================================
 
 
-# ============================ НАСТРОЙКИ (ENV МИНИМУМ) ============================
+# ============================ НАСТРОЙКИ (ENV) ============================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
-SHEET_NAME = os.environ.get("SHEET_NAME", "Лист1")
+SPREADSHEET_ID     = os.environ.get("SPREADSHEET_ID", "")
+SHEET_NAME         = os.environ.get("SHEET_NAME", "Лист1")
+TRIGGER_TEXT       = os.environ.get("TRIGGER_TEXT", "1")
 
-# Остальное статично
-TRIGGER_TEXT = "1"
+# Статичные параметры (оставлены в коде)
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 COL_VIDEO = "A"
@@ -32,9 +32,9 @@ COL_TITLE = "B"
 COL_DESC  = "C"
 DELETE_FIRST_ROW_AFTER_SUCCESS = True
 
-SERVICE_ACCOUNT_FILE = "service_account.json"
-CLIENT_SECRET_FILE   = "client_secret.json"
-TOKEN_FILE           = "token.pickle"
+SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
+CLIENT_SECRET_FILE   = os.environ.get("CLIENT_SECRET_FILE", "client_secret.json")
+TOKEN_FILE           = os.environ.get("TOKEN_FILE", "token.pickle")
 
 YOUTUBE_CATEGORY_ID = "22"
 YOUTUBE_DEFAULT_VISIBILITY = "public"
@@ -47,6 +47,21 @@ YOUTUBE_DEFAULT_TAGS = ["Shorts"]
 def log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{ts} - {msg}")
+
+
+# ---------------------- Проверка обязательных ENV ----------------------
+def ensure_env():
+    missing = []
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not SPREADSHEET_ID:
+        missing.append("SPREADSHEET_ID")
+    if not SHEET_NAME:
+        missing.append("SHEET_NAME")
+    if missing:
+        for k in missing:
+            log(f"❌ Отсутствует переменная окружения: {k}")
+        raise SystemExit(1)
 
 
 # ---------------------- Google Auth & Services ----------------------
@@ -279,6 +294,7 @@ def process_once():
     except Exception as e:
         return {"status": "SHEETS_ACCESS_ERROR", "error": str(e)}
 
+    # Если первая строка пустая — удаляем её
     if not row:
         try:
             delete_first_row(sh)
@@ -318,6 +334,7 @@ def process_once():
 
 # ---------------------- Главный цикл ----------------------
 def main():
+    ensure_env()
     tg_delete_webhook(drop=True)
     log("Сценарий запущен")
     last_update_id = None
