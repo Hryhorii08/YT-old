@@ -1,6 +1,3 @@
-import sys
-sys.stdout.reconfigure(encoding='utf-8')
-
 # ============================ БИБЛИОТЕКИ ============================
 import os
 import re
@@ -21,26 +18,28 @@ from google.auth.transport.requests import Request
 # ===================================================================
 
 
-# ============================ НАСТРОЙКИ (ENV) ============================
+# ============================ НАСТРОЙКИ (ENV МИНИМУМ) ============================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TRIGGER_TEXT = os.environ.get("TRIGGER_TEXT", "1")
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Лист1")
-COL_VIDEO = os.environ.get("COL_VIDEO", "A")
-COL_TITLE = os.environ.get("COL_TITLE", "B")
-COL_DESC  = os.environ.get("COL_DESC", "C")
-DELETE_FIRST_ROW_AFTER_SUCCESS = os.environ.get("DELETE_FIRST_ROW_AFTER_SUCCESS", "true").strip().lower() in ("1","true","yes","y")
 
-SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
-CLIENT_SECRET_FILE   = os.environ.get("CLIENT_SECRET_FILE", "client_secret.json")
-TOKEN_FILE           = os.environ.get("TOKEN_FILE", "token.pickle")
+# Остальное статично
+TRIGGER_TEXT = "1"
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-YOUTUBE_CATEGORY_ID = os.environ.get("YOUTUBE_CATEGORY_ID", "22")
-YOUTUBE_DEFAULT_VISIBILITY = os.environ.get("YOUTUBE_DEFAULT_VISIBILITY", "public")
-YOUTUBE_MADE_FOR_KIDS = os.environ.get("YOUTUBE_MADE_FOR_KIDS", "false").strip().lower() in ("1","true","yes","y")
-YOUTUBE_DEFAULT_TAGS = [t.strip() for t in os.environ.get("YOUTUBE_DEFAULT_TAGS", "Shorts").split(",") if t.strip()]
+COL_VIDEO = "A"
+COL_TITLE = "B"
+COL_DESC  = "C"
+DELETE_FIRST_ROW_AFTER_SUCCESS = True
+
+SERVICE_ACCOUNT_FILE = "service_account.json"
+CLIENT_SECRET_FILE   = "client_secret.json"
+TOKEN_FILE           = "token.pickle"
+
+YOUTUBE_CATEGORY_ID = "22"
+YOUTUBE_DEFAULT_VISIBILITY = "public"
+YOUTUBE_MADE_FOR_KIDS = False
+YOUTUBE_DEFAULT_TAGS = ["Shorts"]
 # ===================================================================
 
 
@@ -280,7 +279,6 @@ def process_once():
     except Exception as e:
         return {"status": "SHEETS_ACCESS_ERROR", "error": str(e)}
 
-    # Если первая строка пустая — удаляем её
     if not row:
         try:
             delete_first_row(sh)
