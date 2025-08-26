@@ -1,15 +1,7 @@
-# ============================ БИБЛИОТЕКИ ============================
-import os
-import re
-import io
-import time
-import json
-import base64
-import pickle
-import tempfile
-import requests
+import os, re, time, json, pickle, tempfile, requests, io, base64
 from datetime import datetime
-from flask import Flask, request, abort
+
+from flask import Flask, request, jsonify
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -17,24 +9,25 @@ from googleapiclient.errors import HttpError
 from google.oauth2.service_account import Credentials as SA_Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
-# ===================================================================
 
-
-# ============================ НАСТРОЙКИ (ENV) ============================
+# ============================ ENV ============================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_TOKEN      = os.environ.get("WEBHOOK_TOKEN", "")         # секрет в URL
+WEBHOOK_TOKEN      = os.environ.get("WEBHOOK_TOKEN", "")
 SPREADSHEET_ID     = os.environ.get("SPREADSHEET_ID", "")
 SHEET_NAME         = os.environ.get("SHEET_NAME", "Лист1")
 TRIGGER_TEXT       = os.environ.get("TRIGGER_TEXT", "1")
 
-SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "/opt/render/project/src/service_account.json")
-CLIENT_SECRET_FILE   = os.environ.get("CLIENT_SECRET_FILE",   "/opt/render/project/src/client_secret.json")
-TOKEN_FILE           = os.environ.get("TOKEN_FILE",           "/opt/render/project/src/token.pickle")
-YOUTUBE_TOKEN_B64    = os.environ.get("YOUTUBE_TOKEN_B64", "")
+# Эти две переменные содержат ИМЕННО JSON строкой
+SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "").strip()
+CLIENT_SECRET_FILE   = os.environ.get("CLIENT_SECRET_FILE", "").strip()
 
-# статичное
+# token.pickle — путь на диске
+TOKEN_FILE         = os.environ.get("TOKEN_FILE", "/opt/render/project/src/token.pickle")
+YOUTUBE_TOKEN_B64  = os.environ.get("YOUTUBE_TOKEN_B64", "")
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# Статичные настройки
 COL_VIDEO = "A"
 COL_TITLE = "B"
 COL_DESC  = "C"
@@ -44,18 +37,14 @@ YOUTUBE_CATEGORY_ID = "22"
 YOUTUBE_DEFAULT_VISIBILITY = "public"
 YOUTUBE_MADE_FOR_KIDS = False
 YOUTUBE_DEFAULT_TAGS = ["Shorts"]
-# ===================================================================
+# ============================================================
 
-
-# ---------------------- Утилиты логирования ----------------------
 def log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{ts} - {msg}", flush=True)
 
-
-# ---------------------- Проверка обязательных ENV ----------------------
 def ensure_env():
-    missing = []
+    miss = []
     for k, v in {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "WEBHOOK_TOKEN": WEBHOOK_TOKEN,
@@ -63,30 +52,26 @@ def ensure_env():
         "SHEET_NAME": SHEET_NAME,
         "SERVICE_ACCOUNT_FILE": SERVICE_ACCOUNT_FILE,
         "CLIENT_SECRET_FILE": CLIENT_SECRET_FILE,
-        "TOKEN_FILE": TOKEN_FILE,
     }.items():
         if not v:
-            missing.append(k)
-    if missing:
-        for k in missing:
+            miss.append(k)
+    if miss:
+        for k in miss:
             log(f"❌ Отсутствует переменная окружения: {k}")
         raise SystemExit(1)
 
-
-# ---------------------- Восстановление token.pickle из base64 ----------------------
-def restore_token_file_if_needed():
+# Восстановить token.pickle из base64 при старте (если надо)
+def maybe_restore_token():
     if YOUTUBE_TOKEN_B64 and not os.path.exists(TOKEN_FILE):
         try:
-            data = base64.b64decode(YOUTUBE_TOKEN_B64)
             os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
-            with open(TOKEN_FILE, "wb") as f:
-                f.write(data)
-            log(f"Создан token.pickle по пути: {TOKEN_FILE}")
-        except Exception as e:
-            log(f"❌ Ошибка восстановления token.pickle: {e}")
+        except Exception:
+            pass
+        with open(TOKEN_FILE, "wb") as f:
+            f.write(base64.b64decode(YOUTUBE_TOKEN_B64))
+        log(f"Создан token.pickle по пути: {TOKEN_FILE}")
 
-
-# ---------------------- Google Auth & Services ----------------------
+# ====================== Google Auth helpers ======================
 SCOPES_YT = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
@@ -96,44 +81,60 @@ SCOPES_SA = [
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
-def _normalize_sheet_id(x: str) -> str:
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", x)
-    return m.group(1) if m else x
+def _sa_credentials():
+    # SERVICE_ACCOUNT_FILE содержит JSON одной строкой
+    if SERVICE_ACCOUNT_FILE.startswith("{"):
+        return SA_Credentials.from_service_account_info(json.loads(SERVICE_ACCOUNT_FILE), scopes=SCOPES_SA)
+    # на всякий случай поддержим путь к файлу
+    return SA_Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES_SA)
 
-_SPREADSHEET_ID = _normalize_sheet_id(SPREADSHEET_ID) if SPREADSHEET_ID else SPREADSHEET_ID
+def _oauth_flow():
+    # CLIENT_SECRET_FILE содержит JSON одной строкой
+    if CLIENT_SECRET_FILE.startswith("{"):
+        return InstalledAppFlow.from_client_config(json.loads(CLIENT_SECRET_FILE), SCOPES_YT)
+    # на всякий случай поддержим путь к файлу
+    return InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES_YT)
 
 _DRIVE = None
 def drive_service():
     global _DRIVE
     if _DRIVE is None:
-        creds = SA_Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES_SA)
-        _DRIVE = build("drive", "v3", credentials=creds, cache_discovery=False)
+        _DRIVE = build("drive", "v3", credentials=_sa_credentials(), cache_discovery=False)
     return _DRIVE
 
 def sheets_service():
-    creds = SA_Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES_SA)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return build("sheets", "v4", credentials=_sa_credentials(), cache_discovery=False)
 
 def youtube_service():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "rb") as f:
-            creds = pickle.load(f)
-    if not creds or not getattr(creds, "valid", False):
-        if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+    # На сервере не запускаем интерактивную авторизацию — ожидаем готовый token.pickle
+    if not os.path.exists(TOKEN_FILE):
+        raise RuntimeError("Отсутствует token.pickle. Задайте YOUTUBE_TOKEN_B64 или загрузите файл в Secret Files и укажите TOKEN_FILE.")
+    with open(TOKEN_FILE, "rb") as f:
+        creds = pickle.load(f)
+
+    if not getattr(creds, "valid", False):
+        if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
             creds.refresh(Request())
+            with open(TOKEN_FILE, "wb") as f:
+                pickle.dump(creds, f)
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES_YT)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, "wb") as f:
-            pickle.dump(creds, f)
+            # как fallback ДЛЯ ЛОКАЛЬНОГО ЗАПУСКА можно раскомментировать 2 строки ниже,
+            # но на сервере Render это не сработает:
+            # flow = _oauth_flow()
+            # creds = flow.run_local_server(port=0)
+            raise RuntimeError("Невозможно обновить OAuth токен. Переавторизуйтесь локально и обновите YOUTUBE_TOKEN_B64.")
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
+# ====================== Sheets helpers ======================
+def _normalize_sheet_id(x: str) -> str:
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", x)
+    return m.group(1) if m else x
 
-# ---------------------- Sheets Helpers ----------------------
+SPREADSHEET_ID = _normalize_sheet_id(SPREADSHEET_ID)
+
 def get_first_row(sh):
     rng = f"{SHEET_NAME}!{COL_VIDEO}1:{COL_DESC}1"
-    res = sh.spreadsheets().values().get(spreadsheetId=_SPREADSHEET_ID, range=rng).execute()
+    res = sh.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=rng).execute()
     vals = res.get("values", [])
     if not vals or not vals[0]:
         return None
@@ -146,7 +147,7 @@ def get_first_row(sh):
     return {"video": v, "title": t, "desc": d}
 
 def get_sheet_id(sh) -> int:
-    meta = sh.spreadsheets().get(spreadsheetId=_SPREADSHEET_ID).execute()
+    meta = sh.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
     for s in meta.get("sheets", []):
         props = s.get("properties", {})
         if props.get("title") == SHEET_NAME:
@@ -158,10 +159,9 @@ def delete_first_row(sh):
     body = {"requests": [{"deleteDimension": {"range": {
         "sheetId": sid, "dimension": "ROWS", "startIndex": 0, "endIndex": 1
     }}}]}
-    sh.spreadsheets().batchUpdate(spreadsheetId=_SPREADSHEET_ID, body=body).execute()
+    sh.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
 
-
-# ---------------------- Источник видео (Drive-safe) ----------------------
+# =================== Video source (Drive-safe) ===================
 DRIVE_ID_RX = re.compile(r"(?:https?://)?(?:drive\.google\.com)/(?:file/d/|open\?id=|uc\?id=)([A-Za-z0-9_-]+)")
 
 def _save_stream_to_tmp(resp) -> str:
@@ -203,11 +203,13 @@ def gdrive_download_public(file_id: str) -> str:
         if "text/html" in (r.headers.get("Content-Type") or ""):
             token = None
             m = re.search(r"confirm=([0-9A-Za-z_]+)", r.text)
-            if m: token = m.group(1)
+            if m:
+                token = m.group(1)
             else:
                 for k, v in r.cookies.items():
                     if k.startswith("download_warning"):
-                        token = v; break
+                        token = v
+                        break
             if token:
                 params["confirm"] = token
                 r = s.get(URL, params=params, stream=True, timeout=180)
@@ -235,8 +237,7 @@ def resolve_video_source(src: str):
         return url_to_tempfile(src), True
     raise FileNotFoundError(f"Источник видео не найден: {src}")
 
-
-# ---------------------- Загрузка на YouTube ----------------------
+# =================== YouTube upload ===================
 class UploadLimitExceeded(Exception):
     pass
 
@@ -276,16 +277,14 @@ def upload_video(yt, file_path: str, title: str, description: str) -> str:
             continue
     return response.get("id")
 
-
-# ---------------------- Telegram Bot API ----------------------
+# =================== Telegram helpers ===================
 def tg_send(chat_id: int, text: str):
     try:
         requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=30)
     except Exception as e:
         log(f"❌ Ошибка: отправка сообщения в Telegram: {e}")
 
-
-# ---------------------- Выполнение задачи ----------------------
+# =================== Core job ===================
 def process_once():
     try:
         sh = sheets_service()
@@ -317,8 +316,10 @@ def process_once():
         return {"status": "UPLOAD_LIMIT", "error": str(e)}
     finally:
         if 'is_temp' in locals() and is_temp and os.path.exists(local_path):
-            try: os.remove(local_path)
-            except Exception: pass
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
 
     if DELETE_FIRST_ROW_AFTER_SUCCESS:
         try:
@@ -328,39 +329,40 @@ def process_once():
 
     return {"status": "OK", "video_id": vid}
 
-
-# ============================ FLASK ============================
+# =================== Flask app (webhook) ===================
 app = Flask(__name__)
 
-@app.get("/")
+@app.route("/", methods=["GET"])
 def root():
-    return "OK", 200
-
-@app.get("/healthz")
-def health():
     return "ok", 200
 
-@app.post(f"/webhook/<token>")
+@app.route("/webhook/<token>", methods=["POST"])
 def webhook(token):
-    # проверяем секрет в URL
     if token != WEBHOOK_TOKEN:
-        abort(403)
+        return "not found", 404
 
     upd = request.get_json(silent=True) or {}
     log("Новый запрос")
     log(f"update: {upd}")
 
     msg = upd.get("message") or upd.get("channel_post") or {}
-    chat = msg.get("chat", {})
+    chat = msg.get("chat", {}) or {}
     chat_id = chat.get("id")
     text = msg.get("text")
 
     if chat_id is None:
-        log("❌ Ошибка: отсутствует chat_id"); log(""); return "ok"
+        log("❌ Ошибка: отсутствует chat_id"); log("")
+        return jsonify({"ok": True}), 200
+
     if text is None or text.strip() == "":
-        tg_send(chat_id, "❌ Ошибка: пустая строка"); log("❌ Ошибка: пустая строка"); log(""); return "ok"
+        tg_send(chat_id, "❌ Ошибка: пустая строка")
+        log("❌ Ошибка: пустая строка"); log("")
+        return jsonify({"ok": True}), 200
+
     if text.strip() != TRIGGER_TEXT:
-        tg_send(chat_id, "Код ничего не активирует"); log("Код ничего не активирует"); log(""); return "ok"
+        tg_send(chat_id, "Код ничего не активирует")
+        log("Код ничего не активирует"); log("")
+        return jsonify({"ok": True}), 200
 
     tg_send(chat_id, "Старт публикации…")
     rep = process_once()
@@ -393,11 +395,12 @@ def webhook(token):
         tg_send(chat_id, f"❌ Ошибка: неизвестный статус: {status}")
         log(f"❌ Ошибка: неизвестный статус: {status}"); log("")
 
-    return "ok"
-
+    return jsonify({"ok": True}), 200
 
 if __name__ == "__main__":
     ensure_env()
-    restore_token_file_if_needed()
+    maybe_restore_token()
     log("Сценарий запущен")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+    # Render сам выставит PORT; fallback 10000
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
