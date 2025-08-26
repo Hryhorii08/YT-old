@@ -1,13 +1,12 @@
+# YT-old_web.py
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+
 # ============================ БИБЛИОТЕКИ ============================
-import os
-import re
-import time
-import json
-import pickle
-import tempfile
+import os, re, io, time, json, pickle, tempfile, threading, base64
 import requests
-import io
 from datetime import datetime
+from flask import Flask, request, jsonify
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -23,19 +22,21 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 SPREADSHEET_ID     = os.environ.get("SPREADSHEET_ID", "")
 SHEET_NAME         = os.environ.get("SHEET_NAME", "Лист1")
 TRIGGER_TEXT       = os.environ.get("TRIGGER_TEXT", "1")
+WEBHOOK_TOKEN      = os.environ.get("WEBHOOK_TOKEN", "webhook-secret")
+PUBLIC_BASE_URL    = os.environ.get("PUBLIC_BASE_URL", "")
+AUTO_SET_WEBHOOK   = os.environ.get("AUTO_SET_WEBHOOK", "0")
 
-# Статичные параметры (оставлены в коде)
+# Файлы/секреты
+SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "/opt/render/project/src/service_account.json")
+CLIENT_SECRET_FILE   = os.environ.get("CLIENT_SECRET_FILE",   "/opt/render/project/src/client_secret.json")
+TOKEN_FILE           = os.environ.get("TOKEN_FILE",           "/opt/render/project/src/token.pickle")
+YOUTUBE_TOKEN_B64    = os.environ.get("YOUTUBE_TOKEN_B64", "")
+GOOGLE_CREDENTIALS   = os.environ.get("GOOGLE_CREDENTIALS", "")  # опционально: весь JSON сервис-аккаунта одной строкой
+
+# Статичные параметры
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-COL_VIDEO = "A"
-COL_TITLE = "B"
-COL_DESC  = "C"
+COL_VIDEO, COL_TITLE, COL_DESC = "A", "B", "C"
 DELETE_FIRST_ROW_AFTER_SUCCESS = True
-
-SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
-CLIENT_SECRET_FILE   = os.environ.get("CLIENT_SECRET_FILE", "client_secret.json")
-TOKEN_FILE           = os.environ.get("TOKEN_FILE", "token.pickle")
-
 YOUTUBE_CATEGORY_ID = "22"
 YOUTUBE_DEFAULT_VISIBILITY = "public"
 YOUTUBE_MADE_FOR_KIDS = False
@@ -46,22 +47,42 @@ YOUTUBE_DEFAULT_TAGS = ["Shorts"]
 # ---------------------- Утилиты логирования ----------------------
 def log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} - {msg}")
+    print(f"{ts} - {msg}", flush=True)
 
 
-# ---------------------- Проверка обязательных ENV ----------------------
+# ---------------------- Проверка ENV и bootstrap секретов ----------------------
 def ensure_env():
     missing = []
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if not SPREADSHEET_ID:
-        missing.append("SPREADSHEET_ID")
-    if not SHEET_NAME:
-        missing.append("SHEET_NAME")
+    for k, v in [("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+                 ("SPREADSHEET_ID", SPREADSHEET_ID),
+                 ("SHEET_NAME", SHEET_NAME),
+                 ("WEBHOOK_TOKEN", WEBHOOK_TOKEN)]:
+        if not v:
+            missing.append(k)
     if missing:
         for k in missing:
             log(f"❌ Отсутствует переменная окружения: {k}")
         raise SystemExit(1)
+
+def bootstrap_credentials():
+    # service_account.json можно отдать через GOOGLE_CREDENTIALS
+    if GOOGLE_CREDENTIALS and not os.path.exists(SERVICE_ACCOUNT_FILE):
+        try:
+            with open(SERVICE_ACCOUNT_FILE, "w", encoding="utf-8") as f:
+                f.write(GOOGLE_CREDENTIALS)
+            log(f"service_account.json создан по пути: {SERVICE_ACCOUNT_FILE}")
+        except Exception as e:
+            log(f"❌ Ошибка создания service_account.json: {e}")
+
+    # token.pickle восстанавливаем из base64 при необходимости
+    if YOUTUBE_TOKEN_B64 and not os.path.exists(TOKEN_FILE):
+        try:
+            os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+            with open(TOKEN_FILE, "wb") as f:
+                f.write(base64.b64decode(YOUTUBE_TOKEN_B64))
+            log(f"token.pickle создан по пути: {TOKEN_FILE}")
+        except Exception as e:
+            log(f"❌ Ошибка восстановления token.pickle: {e}")
 
 
 # ---------------------- Google Auth & Services ----------------------
@@ -260,30 +281,29 @@ def upload_video(yt, file_path: str, title: str, description: str) -> str:
     return response.get("id")
 
 
-# ---------------------- Telegram Bot API ----------------------
-def tg_delete_webhook(drop=True):
-    try:
-        requests.post(f"{TELEGRAM_API}/deleteWebhook", json={"drop_pending_updates": bool(drop)}, timeout=20)
-    except Exception:
-        pass
-
+# ---------------------- Telegram API helpers ----------------------
 def tg_send(chat_id: int, text: str):
     try:
         requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=30)
     except Exception as e:
         log(f"❌ Ошибка: отправка сообщения в Telegram: {e}")
 
-def tg_get_updates(offset: int = None, timeout_s: int = 60):
-    params = {"timeout": timeout_s}
-    if offset is not None:
-        params["offset"] = offset
+def set_webhook():
+    if AUTO_SET_WEBHOOK != "1" or not PUBLIC_BASE_URL:
+        return
+    url = f"{PUBLIC_BASE_URL.rstrip('/')}/telegram/{WEBHOOK_TOKEN}"
     try:
-        r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=timeout_s + 10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log(f"❌ Ошибка: получение апдейтов Telegram: {e}")
-        return {"ok": False, "result": []}
+        r = requests.get(f"{TELEGRAM_API}/getWebhookInfo", timeout=15).json()
+        current = (r.get("result") or {}).get("url", "")
+    except Exception:
+        current = ""
+    if current != url:
+        try:
+            requests.post(f"{TELEGRAM_API}/setWebhook",
+                          json={"url": url, "drop_pending_updates": True}, timeout=30)
+            log(f"Webhook установлен: {url}")
+        except Exception as e:
+            log(f"❌ Ошибка установки webhook: {e}")
 
 
 # ---------------------- Выполнение задачи ----------------------
@@ -294,7 +314,6 @@ def process_once():
     except Exception as e:
         return {"status": "SHEETS_ACCESS_ERROR", "error": str(e)}
 
-    # Если первая строка пустая — удаляем её
     if not row:
         try:
             delete_first_row(sh)
@@ -332,89 +351,94 @@ def process_once():
     return {"status": "OK", "video_id": vid}
 
 
-# ---------------------- Главный цикл ----------------------
-def main():
+# ============================ FLASK APP ============================
+app = Flask(__name__)
+
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
+
+@app.post(f"/telegram/<path:token>")
+def telegram_webhook(token):
+    if token != WEBHOOK_TOKEN:
+        return "forbidden", 403
+
+    upd = request.get_json(silent=True) or {}
+    log("Новый запрос")
+    log(f"update: {upd}")
+
+    msg = upd.get("message") or upd.get("channel_post") or {}
+    chat = msg.get("chat", {}) or {}
+    chat_id = chat.get("id")
+    text = msg.get("text")
+
+    if chat_id is None:
+        log("❌ Ошибка: отсутствует chat_id")
+        return jsonify(ok=True)
+
+    if text is None or text.strip() == "":
+        tg_send(chat_id, "❌ Ошибка: пустая строка")
+        log("❌ Ошибка: пустая строка")
+        return jsonify(ok=True)
+
+    if text.strip() != TRIGGER_TEXT:
+        tg_send(chat_id, "Код ничего не активирует")
+        log("Код ничего не активирует")
+        return jsonify(ok=True)
+
+    tg_send(chat_id, "Старт публикации…")
+
+    # выполняем обработку в отдельном потоке, чтобы Telegram не ждал долгую загрузку
+    def worker():
+        rep = process_once()
+        status = rep.get("status")
+        if status == "OK":
+            vid = rep["video_id"]
+            tg_send(chat_id, f"Создано видео, ID: {vid}")
+            log(f"Создано видео, ID: {vid}")
+            log("")
+        elif status == "UPLOAD_LIMIT":
+            tg_send(chat_id, "Лимит отправки видео на YouTube")
+            log("Лимит отправки видео на YouTube")
+            log("")
+        elif status == "EMPTY_SHEET":
+            tg_send(chat_id, "❌ Ошибка: нет данных в таблице")
+            log("❌ Ошибка: нет данных в таблице")
+            log("")
+        elif status == "SHEETS_ACCESS_ERROR":
+            tg_send(chat_id, f"❌ Ошибка: доступ к таблице: {rep.get('error')}")
+            log(f"❌ Ошибка: доступ к таблице: {rep.get('error')}")
+            log("")
+        elif status == "DOWNLOAD_ERROR":
+            tg_send(chat_id, f"❌ Ошибка: загрузка видео: {rep.get('error')}")
+            log(f"❌ Ошибка: загрузка видео: {rep.get('error')}")
+            log("")
+        elif status == "YOUTUBE_AUTH_ERROR":
+            tg_send(chat_id, f"❌ Ошибка: авторизация YouTube: {rep.get('error')}")
+            log(f"❌ Ошибка: авторизация YouTube: {rep.get('error')}")
+            log("")
+        elif status == "ROW_DELETE_ERROR":
+            vid = rep.get("video_id", "")
+            tg_send(chat_id, f"❌ Ошибка: удаление строки: {rep.get('error')} (Видео загружено: {vid})")
+            log(f"❌ Ошибка: удаление строки: {rep.get('error')} (Видео загружено: {vid})")
+            log("")
+        else:
+            tg_send(chat_id, f"❌ Ошибка: неизвестный статус: {status}")
+            log(f"❌ Ошибка: неизвестный статус: {status}")
+            log("")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify(ok=True)
+
+
+# ---------------------- Запуск ----------------------
+def run():
     ensure_env()
-    tg_delete_webhook(drop=True)
+    bootstrap_credentials()
+    set_webhook()
     log("Сценарий запущен")
-    last_update_id = None
-    while True:
-        data = tg_get_updates(last_update_id + 1 if last_update_id else None, timeout_s=60)
-        if not data.get("ok"):
-            time.sleep(1)
-            continue
-        for upd in data.get("result", []):
-            log("Новый запрос")
-            log(f"update: {upd}")
-            last_update_id = upd["update_id"]
-            try:
-                msg = upd.get("message") or upd.get("channel_post") or {}
-                chat = msg.get("chat", {})
-                chat_id = chat.get("id")
-                text = msg.get("text")
-                if chat_id is None:
-                    log("❌ Ошибка: отсутствует chat_id")
-                    log("")
-                    continue
-                if text is None or text.strip() == "":
-                    tg_send(chat_id, "❌ Ошибка: пустая строка")
-                    log("❌ Ошибка: пустая строка")
-                    log("")
-                    continue
-                if text.strip() != TRIGGER_TEXT:
-                    tg_send(chat_id, "Код ничего не активирует")
-                    log("Код ничего не активирует")
-                    log("")
-                    continue
-
-                tg_send(chat_id, "Старт публикации…")
-                rep = process_once()
-                status = rep.get("status")
-
-                if status == "OK":
-                    vid = rep["video_id"]
-                    tg_send(chat_id, f"Создано видео, ID: {vid}")
-                    log(f"Создано видео, ID: {vid}")
-                    log("")
-                elif status == "UPLOAD_LIMIT":
-                    tg_send(chat_id, "Лимит отправки видео на YouTube")
-                    log("Лимит отправки видео на YouTube")
-                    log("")
-                elif status == "EMPTY_SHEET":
-                    tg_send(chat_id, "❌ Ошибка: нет данных в таблице")
-                    log("❌ Ошибка: нет данных в таблице")
-                    log("")
-                elif status == "SHEETS_ACCESS_ERROR":
-                    tg_send(chat_id, f"❌ Ошибка: доступ к таблице: {rep.get('error')}")
-                    log(f"❌ Ошибка: доступ к таблице: {rep.get('error')}")
-                    log("")
-                elif status == "DOWNLOAD_ERROR":
-                    tg_send(chat_id, f"❌ Ошибка: загрузка видео: {rep.get('error')}")
-                    log(f"❌ Ошибка: загрузка видео: {rep.get('error')}")
-                    log("")
-                elif status == "YOUTUBE_AUTH_ERROR":
-                    tg_send(chat_id, f"❌ Ошибка: авторизация YouTube: {rep.get('error')}")
-                    log(f"❌ Ошибка: авторизация YouTube: {rep.get('error')}")
-                    log("")
-                elif status == "ROW_DELETE_ERROR":
-                    vid = rep.get("video_id", "")
-                    tg_send(chat_id, f"❌ Ошибка: удаление строки: {rep.get('error')} (Видео загружено: {vid})")
-                    log(f"❌ Ошибка: удаление строки: {rep.get('error')} (Видео загружено: {vid})")
-                    log("")
-                else:
-                    tg_send(chat_id, f"❌ Ошибка: неизвестный статус: {status}")
-                    log(f"❌ Ошибка: неизвестный статус: {status}")
-                    log("")
-            except Exception as e:
-                try:
-                    chat_id = (upd.get("message") or upd.get("channel_post") or {}).get("chat", {}).get("id")
-                    if chat_id is not None:
-                        tg_send(chat_id, f"❌ Ошибка: {e}")
-                except Exception:
-                    pass
-                log(f"❌ Ошибка: {e}")
-                log("")
-        time.sleep(0.5)
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    main()
+    run()
