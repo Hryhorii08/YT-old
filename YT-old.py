@@ -7,7 +7,6 @@ import pickle
 import tempfile
 import requests
 import io
-import base64
 from datetime import datetime
 
 from googleapiclient.discovery import build
@@ -36,7 +35,6 @@ DELETE_FIRST_ROW_AFTER_SUCCESS = True
 SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
 CLIENT_SECRET_FILE   = os.environ.get("CLIENT_SECRET_FILE", "client_secret.json")
 TOKEN_FILE           = os.environ.get("TOKEN_FILE", "token.pickle")
-YOUTUBE_TOKEN_B64    = os.environ.get("YOUTUBE_TOKEN_B64", "")
 
 YOUTUBE_CATEGORY_ID = "22"
 YOUTUBE_DEFAULT_VISIBILITY = "public"
@@ -49,18 +47,6 @@ YOUTUBE_DEFAULT_TAGS = ["Shorts"]
 def log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{ts} - {msg}")
-
-
-# ---------------------- Восстановление token.pickle из ENV (base64) ----------------------
-def ensure_token_file():
-    try:
-        if YOUTUBE_TOKEN_B64 and not os.path.exists(TOKEN_FILE):
-            os.makedirs(os.path.dirname(TOKEN_FILE) or ".", exist_ok=True)
-            with open(TOKEN_FILE, "wb") as f:
-                f.write(base64.b64decode(YOUTUBE_TOKEN_B64))
-            log(f"Создан TOKEN_FILE по пути: {TOKEN_FILE}")
-    except Exception as e:
-        log(f"❌ Ошибка: запись TOKEN_FILE: {e}")
 
 
 # ---------------------- Проверка обязательных ENV ----------------------
@@ -106,7 +92,6 @@ def sheets_service():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 def youtube_service():
-    ensure_token_file()  # сначала попробуем восстановить токен из ENV
     creds = None
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, "rb") as f:
@@ -115,7 +100,6 @@ def youtube_service():
         if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
             creds.refresh(Request())
         else:
-            # На сервере лучше иметь готовый TOKEN_FILE; ниже — интерактивный OAuth (локально)
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES_YT)
             creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, "wb") as f:
