@@ -370,8 +370,8 @@ def webhook(token):
 
     if status == "OK":
         vid = rep["video_id"]
-        tg_send(chat_id, f"Создано видео, ID: {vid}")
-        log(f"Создано видео, ID: {vid}"); log("")
+        tg_send(chat_id, f"Создано видео для старого youtube, ID: {vid}")
+        log(f"Создано видео для старого youtube, ID: {vid}"); log("")
     elif status == "UPLOAD_LIMIT":
         tg_send(chat_id, "Лимит отправки видео на YouTube")
         log("Лимит отправки видео на YouTube"); log("")
